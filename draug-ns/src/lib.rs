@@ -45,6 +45,7 @@ mod other {
     const MSG: &str = "the draug-ns backend requires Linux";
 
     /// Stub so the workspace (and its tests) compile on non-Linux hosts.
+    #[derive(Clone)]
     pub struct NsBackend;
 
     impl NsBackend {

@@ -1,8 +1,11 @@
 //! sbx: the draug CLI.
 
+mod mcp;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use draug_core::{Backend, Error, ExecEvent, ExecRequest, Registry, ResourceLimits, SandboxSpec};
@@ -95,8 +98,16 @@ enum Command {
     },
     /// Kill a sandbox's processes and delete all its state
     Destroy { sandbox: String },
-    /// Serve the draug MCP server over stdio
-    Mcp,
+    /// Serve the draug sandbox toolset as an MCP server over stdio
+    /// (JSON-RPC 2.0), for use by LLM agents (e.g. Claude Code)
+    Mcp {
+        /// Host-side deadline applied to every tool call, in seconds
+        #[arg(long, default_value_t = 300)]
+        call_timeout: u64,
+        /// Maximum number of sandboxes that may exist at once
+        #[arg(long, default_value_t = 8)]
+        max_sandboxes: usize,
+    },
 }
 
 fn main() {
@@ -157,7 +168,7 @@ async fn run(cli: Cli) -> i32 {
 async fn dispatch(
     cmd: Command,
     backend: &NsBackend,
-    registry: &Registry,
+    registry: &Arc<Registry>,
 ) -> Result<i32, Error> {
     match cmd {
         Command::Run {
@@ -289,8 +300,21 @@ async fn dispatch(
             }
             Ok(0)
         }
-        Command::Mcp => Err(Error::Unsupported(
-            "the MCP server is not implemented yet".into(),
-        )),
+        Command::Mcp {
+            call_timeout,
+            max_sandboxes,
+        } => {
+            let config = mcp::McpConfig {
+                call_timeout: Duration::from_secs(call_timeout),
+                max_sandboxes,
+            };
+            // Diagnostics only — stdout is the JSON-RPC channel.
+            eprintln!(
+                "sbx: MCP server on stdio (max {max_sandboxes} sandboxes, \
+                 {call_timeout}s call timeout)"
+            );
+            mcp::serve(backend.clone(), Arc::clone(registry), config).await?;
+            Ok(0)
+        }
     }
 }
