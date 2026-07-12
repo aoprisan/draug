@@ -92,6 +92,13 @@ pub struct SandboxSpec {
     pub env: Vec<(String, String)>,
     /// Whether the sandbox gets (loopback-only) network access.
     pub network: bool,
+    /// Insecure escape hatch: if a private `/proc` cannot be mounted (a host
+    /// that masks parts of `/proc`, e.g. running draug inside a hardened
+    /// container), fall back to bind-mounting the *host's* `/proc`. This
+    /// exposes host processes via `/proc/<pid>/{root,cwd,fd}` — a filesystem
+    /// escape to the invoking user's own files — so it is **off by default**;
+    /// spawn fails closed instead. Only enable on a trusted host.
+    pub allow_host_proc_fallback: bool,
 }
 
 /// A live sandbox as recorded in the registry.
@@ -118,8 +125,43 @@ pub struct SnapshotMeta {
     /// Sandbox this was taken from; `None` if that sandbox was destroyed.
     pub sandbox_id: Option<SandboxId>,
     pub name: String,
-    /// Directory holding the captured upper layer.
+    /// Directory holding the captured upper layer (in `upper/` beneath it).
     pub path: PathBuf,
+    /// Base image the captured layer applies on top of (overlayfs lowerdir
+    /// of the sandbox the snapshot was taken from).
+    pub rootfs: PathBuf,
+    /// Total bytes of regular-file content in the captured layer.
+    pub size_bytes: u64,
     /// Unix timestamp (seconds).
     pub created_at: i64,
+}
+
+/// How a path in an overlay upper layer differs from the base image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffKind {
+    /// Present in the layer, absent from the base.
+    Added,
+    /// Present in both; the layer's version shadows the base's.
+    Modified,
+    /// Present in the base, removed by the layer (overlayfs whiteout or
+    /// a path shadowed away by an opaque/replacing entry).
+    Deleted,
+}
+
+/// One changed path in a layer-vs-base diff.
+///
+/// `size`/`mode` describe the layer's version for `Added`/`Modified` and the
+/// base's (now gone) version for `Deleted`; they are `None` where they carry
+/// no information (e.g. directory sizes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffEntry {
+    /// Path relative to the base image root, `/`-separated.
+    pub path: String,
+    pub kind: DiffKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Full `st_mode` in octal (e.g. `"100644"`, `"40755"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }

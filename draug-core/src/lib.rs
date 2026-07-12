@@ -14,4 +14,6 @@ pub use backend::{Backend, ExecEvent, ExecHandle, ExecRequest};
 pub use error::{Error, ExecErrorKind, ResourceKind, Result};
 pub use limits::ResourceLimits;
 pub use registry::Registry;
-pub use types::{Sandbox, SandboxId, SandboxSpec, SandboxState, SnapshotId, SnapshotMeta};
+pub use types::{
+    DiffEntry, DiffKind, Sandbox, SandboxId, SandboxSpec, SandboxState, SnapshotId, SnapshotMeta,
+};

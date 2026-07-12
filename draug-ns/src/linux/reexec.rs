@@ -13,10 +13,13 @@ use super::setup;
 pub const REEXEC_ENV: &str = "DRAUG_REEXEC";
 pub const CONFIG_ENV: &str = "DRAUG_SETUP_CONFIG";
 pub const CLEANUP_DIR_ENV: &str = "DRAUG_CLEANUP_DIR";
+pub const COPY_SRC_ENV: &str = "DRAUG_COPY_SRC";
+pub const COPY_DST_ENV: &str = "DRAUG_COPY_DST";
 
 pub const MODE_SETUP: &str = "setup";
 pub const MODE_PROBE: &str = "probe";
 pub const MODE_CLEANUP: &str = "cleanup";
+pub const MODE_COPY: &str = "copy";
 
 /// If this process was re-executed for a draug-ns helper role, run that role
 /// and never return. Otherwise, return immediately.
@@ -55,6 +58,7 @@ pub fn maybe_run() {
             let dir = std::env::var(CLEANUP_DIR_ENV).unwrap_or_default();
             cleanup(&dir) // never returns
         }
+        MODE_COPY => copy(), // never returns
         other => {
             eprintln!("draug-ns: unknown re-exec mode {other:?}");
             std::process::exit(2);
@@ -90,4 +94,37 @@ fn cleanup(dir: &str) -> ! {
     }
     println!("done");
     std::process::exit(0);
+}
+
+/// Copy a layer between two host directories that may contain files owned
+/// by subordinate uids and overlayfs whiteouts: enter a user namespace with
+/// the spawn-time mapping so those files map back to ids we control, then
+/// run the ordinary tree copy. Same line protocol as setup/cleanup; ends
+/// with `done <bytes-copied>`.
+fn copy() -> ! {
+    use std::io::BufRead;
+    let fail = |msg: String| -> ! {
+        println!("err {}", msg.replace('\n', " "));
+        std::process::exit(1);
+    };
+    let src = std::env::var_os(COPY_SRC_ENV).unwrap_or_default();
+    let dst = std::env::var_os(COPY_DST_ENV).unwrap_or_default();
+    if src.is_empty() || dst.is_empty() {
+        fail("copy: missing source or destination".into());
+    }
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
+        fail(format!("copy: unshare(CLONE_NEWUSER): {e}"));
+    }
+    println!("unshared");
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() || line.trim() != "go" {
+        fail("copy: host did not confirm uid mapping".into());
+    }
+    match super::fscopy::copy_tree(std::path::Path::new(&src), std::path::Path::new(&dst)) {
+        Ok(bytes) => {
+            println!("done {bytes}");
+            std::process::exit(0);
+        }
+        Err(e) => fail(format!("copy: {e}")),
+    }
 }

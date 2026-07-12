@@ -44,6 +44,10 @@ pub struct SetupConfig {
     /// Whether the *host* side runs as real root (identity uid map, no
     /// userxattr needed for overlayfs).
     pub host_is_root: bool,
+    /// Permit falling back to the host's `/proc` when a private one can't be
+    /// mounted. Insecure (see `SandboxSpec::allow_host_proc_fallback`);
+    /// default false means the sandbox fails closed instead.
+    pub allow_host_proc_fallback: bool,
 }
 
 pub fn run(cfg: SetupConfig) -> ! {
@@ -104,7 +108,7 @@ fn run_inner(cfg: &SetupConfig) -> Result<(), String> {
             std::process::exit(0);
         }
         ForkResult::Child => {
-            if let Err(msg) = mount_proc_and_pivot(&root) {
+            if let Err(msg) = mount_proc_and_pivot(&root, cfg.allow_host_proc_fallback) {
                 println!("err {}", msg.replace('\n', " "));
                 let _ = std::io::stdout().flush();
                 std::process::exit(1);
@@ -122,7 +126,7 @@ fn run_inner(cfg: &SetupConfig) -> Result<(), String> {
 }
 
 /// Runs as PID 1 of the new pid namespace, old root still attached.
-fn mount_proc_and_pivot(root: &Path) -> Result<(), String> {
+fn mount_proc_and_pivot(root: &Path, allow_host_proc_fallback: bool) -> Result<(), String> {
     let proc_dir = root.join("proc");
     let fresh = mount(
         Some("proc"),
@@ -131,16 +135,28 @@ fn mount_proc_and_pivot(root: &Path) -> Result<(), String> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
     );
-    if fresh.is_err() {
+    if let Err(e) = fresh {
         // Hosts that mask parts of /proc (hardened container runtimes) fail
         // the kernel's "fully visible" rule for fresh proc mounts in a user
-        // namespace. Falling back to the host's procfs keeps tools working,
-        // at the cost of showing host-pidns pids.
+        // namespace. Binding the *host's* procfs would restore tools, but it
+        // also exposes /proc/<host-pid>/{root,cwd,fd} — a path straight back
+        // to the invoking user's real files, defeating the sandbox. So we
+        // fail closed unless explicitly allowed.
+        if !allow_host_proc_fallback {
+            return Err(format!(
+                "cannot mount a private /proc for the sandbox (fresh procfs refused: {e}). \
+                 This host masks parts of /proc (common inside hardened containers). \
+                 Refusing to fall back to the host's /proc, which would expose host \
+                 processes and the user's files via /proc/<pid>/root. Run draug on a host \
+                 that permits a private procfs, or pass --insecure-host-proc to override \
+                 (unsafe)."
+            ));
+        }
         bind(Path::new("/proc"), &proc_dir, MsFlags::MS_REC)
             .map_err(|e| format!("fresh proc mount refused and bind fallback failed ({e})"))?;
         println!(
-            "warn cannot mount a private /proc (host /proc is masked?); \
-             the sandbox sees the host's /proc instead"
+            "warn INSECURE: private /proc unavailable; bound the host's /proc as requested. \
+             The sandbox can reach host processes and the user's files via /proc/<pid>/root"
         );
         let _ = std::io::stdout().flush();
     }
@@ -301,23 +317,35 @@ fn bind_system_dir(root: &Path, dir: &str) -> Result<(), String> {
 /// Remount `top` and every mount below it read-only, preserving each
 /// mount's existing flags (dropping flags of a mount inherited from a more
 /// privileged namespace is refused by the kernel).
+///
+/// Fail closed: if a submount is writable and we cannot remount it
+/// read-only (e.g. a locked mount inherited from a more privileged
+/// namespace), refuse the spawn rather than leave a host-writable path
+/// inside the sandbox. A submount that is *already* read-only is fine.
 fn remount_ro_recursive(top: &Path) -> Result<(), String> {
-    for (mountpoint, flags) in mounts_under(top)? {
+    for (mountpoint, flags, already_ro) in mounts_under(top)? {
         let remount = MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | flags;
         if let Err(e) = mount(None::<&str>, &mountpoint, None::<&str>, remount, None::<&str>) {
-            // A locked submount we can't touch: tolerable for submounts,
-            // fatal for the top-level dir (it would stay writable).
             if mountpoint == top {
                 return Err(format!("remount {} read-only: {e}", top.display()));
             }
+            if !already_ro {
+                return Err(format!(
+                    "refusing to continue: submount {} under a read-only system dir is \
+                     writable and could not be remounted read-only ({e}); it would be a \
+                     host-writable path inside the sandbox",
+                    mountpoint.display()
+                ));
+            }
+            // Already read-only and merely un-remountable: safe to leave.
         }
     }
     Ok(())
 }
 
-/// (mountpoint, existing flags) for `top` and everything mounted beneath it,
-/// from /proc/self/mountinfo.
-fn mounts_under(top: &Path) -> Result<Vec<(PathBuf, MsFlags)>, String> {
+/// (mountpoint, existing flags, already-read-only) for `top` and everything
+/// mounted beneath it, from /proc/self/mountinfo.
+fn mounts_under(top: &Path) -> Result<Vec<(PathBuf, MsFlags, bool)>, String> {
     let info = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| format!("read mountinfo: {e}"))?;
     let mut out = Vec::new();
@@ -328,11 +356,12 @@ fn mounts_under(top: &Path) -> Result<Vec<(PathBuf, MsFlags)>, String> {
         };
         let mp = PathBuf::from(unescape_mountinfo(mp));
         if mp == top || mp.starts_with(top) {
-            out.push((mp, parse_mount_opts(opts)));
+            let already_ro = opts.split(',').any(|o| o == "ro");
+            out.push((mp, parse_mount_opts(opts), already_ro));
         }
     }
     // Parents before children so the top-level remount happens first.
-    out.sort_by_key(|(p, _)| p.components().count());
+    out.sort_by_key(|(p, _, _)| p.components().count());
     Ok(out)
 }
 

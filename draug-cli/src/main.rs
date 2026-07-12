@@ -1,8 +1,11 @@
 //! sbx: the draug CLI.
 
+mod mcp;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use draug_core::{Backend, Error, ExecEvent, ExecRequest, Registry, ResourceLimits, SandboxSpec};
@@ -51,6 +54,12 @@ enum Command {
         /// Extra environment for every exec, KEY=VALUE (repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// UNSAFE: if a private /proc can't be mounted (a host that masks
+        /// /proc), fall back to the host's /proc. This exposes host processes
+        /// and the user's files via /proc/<pid>/root — off by default; the
+        /// sandbox fails closed instead.
+        #[arg(long)]
+        insecure_host_proc: bool,
     },
     /// Run a command inside a sandbox, streaming its output
     Exec {
@@ -73,15 +82,38 @@ enum Command {
     /// Snapshots capture files, not processes: after restore, re-run
     /// whatever was running.
     Snapshot { sandbox: String, name: String },
-    /// Replace a sandbox's filesystem with a snapshot's contents
-    Restore { sandbox: String, snapshot: String },
-    /// Show filesystem changes between two snapshots, or between a
-    /// snapshot and the live sandbox
-    Diff { from: String, to: Option<String> },
+    /// Materialize a new sandbox whose writable layer starts from a
+    /// snapshot's captured contents (over the same base image). The
+    /// snapshot and any originating sandbox are left untouched.
+    Restore {
+        /// Snapshot id or name to restore from
+        snapshot: String,
+        /// Name for the new sandbox
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show a layer's filesystem changes against its base image, as
+    /// added/modified/deleted paths. The target is a snapshot or a live
+    /// sandbox (id or name).
+    Diff {
+        /// Snapshot or sandbox to inspect
+        target: String,
+        /// Emit machine-readable JSON instead of a text summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a sandbox's processes and delete all its state
     Destroy { sandbox: String },
-    /// Serve the draug MCP server over stdio
-    Mcp,
+    /// Serve the draug sandbox toolset as an MCP server over stdio
+    /// (JSON-RPC 2.0), for use by LLM agents (e.g. Claude Code)
+    Mcp {
+        /// Host-side deadline applied to every tool call, in seconds
+        #[arg(long, default_value_t = 300)]
+        call_timeout: u64,
+        /// Maximum number of sandboxes that may exist at once
+        #[arg(long, default_value_t = 8)]
+        max_sandboxes: usize,
+    },
 }
 
 fn main() {
@@ -130,6 +162,14 @@ async fn run(cli: Cli) -> i32 {
     };
     let backend = NsBackend::new(Arc::clone(&registry), state_root);
 
+    // Self-heal: reap sandboxes whose guest died (crash/reboot) and thaw any
+    // cgroup left frozen by a crash mid-snapshot, before doing anything else.
+    match backend.reconcile().await {
+        Ok(n) if n > 0 => eprintln!("sbx: reconciled {n} stale sandbox(es)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("sbx: warning: reconcile failed: {e}"),
+    }
+
     match dispatch(cli.command, &backend, &registry).await {
         Ok(code) => code,
         Err(e) => {
@@ -142,7 +182,7 @@ async fn run(cli: Cli) -> i32 {
 async fn dispatch(
     cmd: Command,
     backend: &NsBackend,
-    registry: &Registry,
+    registry: &Arc<Registry>,
 ) -> Result<i32, Error> {
     match cmd {
         Command::Run {
@@ -153,6 +193,7 @@ async fn dispatch(
             pids_max,
             network,
             env,
+            insecure_host_proc,
         } => {
             let env = parse_env(&env).map_err(Error::InvalidSpec)?;
             let spec = SandboxSpec {
@@ -168,6 +209,7 @@ async fn dispatch(
                 },
                 env,
                 network,
+                allow_host_proc_fallback: insecure_host_proc,
             };
             let sb = backend.spawn(&spec).await?;
             match &sb.name {
@@ -234,13 +276,61 @@ async fn dispatch(
             eprintln!("sandbox {id} destroyed");
             Ok(0)
         }
-        Command::Snapshot { .. } | Command::Restore { .. } | Command::Diff { .. } => {
-            Err(Error::Unsupported(
-                "snapshot/restore/diff are not implemented yet".into(),
-            ))
+        Command::Snapshot { sandbox, name } => {
+            let sb = registry.get_sandbox(&sandbox)?;
+            let snap = backend.snapshot(&sb.id, &name).await?;
+            eprintln!("snapshot {snap} ({name}) captured from {}", sb.id);
+            println!("{snap}");
+            Ok(0)
         }
-        Command::Mcp => Err(Error::Unsupported(
-            "the MCP server is not implemented yet".into(),
-        )),
+        Command::Restore { snapshot, name } => {
+            let snap = registry.get_snapshot(&snapshot)?;
+            let sb = backend.restore(&snap.id, name).await?;
+            match &sb.name {
+                Some(n) => eprintln!("restored snapshot {} into sandbox {} ({n})", snap.id, sb.id),
+                None => eprintln!("restored snapshot {} into sandbox {}", snap.id, sb.id),
+            }
+            println!("{}", sb.id);
+            Ok(0)
+        }
+        Command::Diff { target, json } => {
+            let entries = backend.diff(&target).await?;
+            if json {
+                let out = serde_json::to_string_pretty(&entries)
+                    .map_err(|e| Error::io("serialize diff", std::io::Error::other(e)))?;
+                println!("{out}");
+            } else if entries.is_empty() {
+                eprintln!("no changes against the base image");
+            } else {
+                for e in &entries {
+                    let mark = match e.kind {
+                        draug_core::DiffKind::Added => '+',
+                        draug_core::DiffKind::Modified => '~',
+                        draug_core::DiffKind::Deleted => '-',
+                    };
+                    match &e.size {
+                        Some(size) => println!("{mark} {} ({size} bytes)", e.path),
+                        None => println!("{mark} {}", e.path),
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Command::Mcp {
+            call_timeout,
+            max_sandboxes,
+        } => {
+            let config = mcp::McpConfig {
+                call_timeout: Duration::from_secs(call_timeout),
+                max_sandboxes,
+            };
+            // Diagnostics only — stdout is the JSON-RPC channel.
+            eprintln!(
+                "sbx: MCP server on stdio (max {max_sandboxes} sandboxes, \
+                 {call_timeout}s call timeout)"
+            );
+            mcp::serve(backend.clone(), Arc::clone(registry), config).await?;
+            Ok(0)
+        }
     }
 }

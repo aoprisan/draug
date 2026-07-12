@@ -21,6 +21,10 @@ clap = { version = "4", features = ["derive"] }
 nix = "0.29"
 libc = "0.2"
 tempfile = "3"
+# MCP server SDK (stdio transport). `server` + `macros` are on by default;
+# `transport-io` adds the stdio transport used by `sbx mcp`.
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
+schemars = "1.0"
 
 draug-proto = { path = "draug-proto" }
 draug-core = { path = "draug-core" }

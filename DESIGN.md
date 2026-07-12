@@ -48,10 +48,11 @@ pub trait Backend: Send + Sync {
     /// Capture the sandbox's *filesystem* state (see "Snapshot semantics").
     async fn snapshot(&self, id: &SandboxId, name: &str) -> Result<SnapshotId>;
 
-    /// Replace the sandbox's filesystem with a snapshot's contents.
-    /// The sandbox must be stopped or is stopped as part of restore;
-    /// running processes are killed, not resurrected.
-    async fn restore(&self, id: &SandboxId, snapshot: &SnapshotId) -> Result<()>;
+    /// Materialize a *new* sandbox whose writable layer starts from the
+    /// snapshot's captured layer (over the same base image). The snapshot is
+    /// immutable and restorable any number of times; the originating sandbox
+    /// is untouched. Files come back exactly as captured; processes do not.
+    async fn restore(&self, snapshot: &SnapshotId, name: Option<String>) -> Result<Sandbox>;
 
     /// Kill everything, unmount, delete on-disk state, remove from registry.
     /// Idempotent: destroying a half-created or already-gone sandbox is Ok.
@@ -75,13 +76,23 @@ pub trait Backend: Send + Sync {
   `restore` must not leak kernel state unaccounted for. The rule is
   *registry-first*: record intent (row in state `Creating`/`Restoring`)
   before touching the kernel, and mark `Ready` only after. Anything left in
-  an intermediate state is garbage-collectable by `destroy` or a future
-  `sbx gc`. Dropping an `ExecHandle` kills the remote command (best-effort
-  SIGKILL to the exec'd process group via the guest).
+  an intermediate state is reclaimed by `NsBackend::reconcile()`, which every
+  `sbx`/`mcp` process runs at startup: it walks the registry, and for any
+  sandbox whose guest is provably gone (pid+starttime mismatch, or a zombie)
+  it frees the cgroup, deletes the on-disk state, and drops the row; it also
+  thaws a cgroup left frozen by a crash mid-snapshot. Dropping an `ExecHandle`
+  kills the remote command (best-effort SIGKILL to the exec'd process group
+  via the guest).
 - `Backend` implementations are cheap handles (`Arc` internals) — cloneable,
-  shareable across tasks; per-sandbox mutation is serialized by a
-  per-sandbox async lock inside the backend, so concurrent `exec` +
-  `snapshot` on the same sandbox cannot interleave destructively.
+  shareable across tasks. `spawn`, `snapshot`, and `destroy` on one sandbox
+  are serialized by a per-sandbox `flock` on `<state-dir>/op.lock`, which
+  holds across tasks *and* across processes (zero-daemon: several `sbx`
+  invocations can race). That lock is also what lets `reconcile` distinguish
+  a crashed sandbox (lock free) from one with an operation in flight (lock
+  held), so startup GC never reaps a sibling's in-progress spawn. `exec` is
+  deliberately *not* gated by the op-lock — snapshotting a *live* sandbox
+  instead relies on the cgroup freeze (best-effort; see the snapshot section)
+  for a consistent upper layer.
 
 ### Sandbox lifecycle states
 
@@ -112,9 +123,12 @@ briefly pauses spawned processes' filesystem work by freezing the cgroup),
 `snapshots/<id>/`. The base image is immutable and shared, so a snapshot is
 just "the delta this sandbox has made", which is small and fast to copy.
 
-`restore` stops the sandbox's processes, unmounts the overlay, replaces the
-upperdir with the snapshot's copy, and remounts. The sandbox comes back with
-the *files* exactly as they were at snapshot time.
+`restore` spawns a *new* sandbox and seeds its upperdir from a copy of the
+snapshot's captured layer, over the same base image. The new sandbox comes up
+with the *files* exactly as they were at snapshot time; the snapshot stays
+immutable and the sandbox it was taken from is left running/untouched.
+(Seeding a fresh sandbox rather than mutating the original keeps snapshots
+reusable and sidesteps the unmount/remount dance on a live overlay.)
 
 What this deliberately does **not** capture, and users must not expect:
 
@@ -140,10 +154,13 @@ running."*
 Snapshots are immutable once taken, are metadata-registered in SQLite
 (id, sandbox id, name, created-at, size, parent base image), and survive the
 sandbox they came from — `spawn` may take `--from-snapshot` to seed a new
-sandbox's upperdir. `diff` compares two snapshots (or a snapshot against the
-live upperdir) by walking upper layers: overlayfs represents deletions as
-character-0:0 whiteout devices and opaque dirs via xattr, so a diff walker
-must decode those rather than treat them as regular files.
+sandbox's upperdir (this is exactly what `restore` does). `diff` walks a
+single layer — a snapshot's captured upper, or a live sandbox's upper — and
+reports how it differs from its base image as added/modified/deleted paths:
+overlayfs represents deletions as character-0:0 whiteout devices and replaced
+directories via an `overlay.opaque` xattr, so the walker decodes those rather
+than treating them as regular files. Output is structured (`DiffEntry` with
+path, kind, and per-file size/mode), rendered as text or JSON by the CLI.
 
 ## Exec protocol
 

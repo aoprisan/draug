@@ -45,11 +45,20 @@ mod other {
     const MSG: &str = "the draug-ns backend requires Linux";
 
     /// Stub so the workspace (and its tests) compile on non-Linux hosts.
+    #[derive(Clone)]
     pub struct NsBackend;
 
     impl NsBackend {
         pub fn new(_registry: Arc<Registry>, _state_root: PathBuf) -> Self {
             Self
+        }
+
+        pub async fn diff(&self, _target: &str) -> Result<Vec<draug_core::DiffEntry>> {
+            Err(Error::Unsupported(MSG.into()))
+        }
+
+        pub async fn reconcile(&self) -> Result<usize> {
+            Ok(0)
         }
     }
 
@@ -64,7 +73,7 @@ mod other {
         async fn snapshot(&self, _id: &SandboxId, _name: &str) -> Result<SnapshotId> {
             Err(Error::Unsupported(MSG.into()))
         }
-        async fn restore(&self, _id: &SandboxId, _snapshot: &SnapshotId) -> Result<()> {
+        async fn restore(&self, _snapshot: &SnapshotId, _name: Option<String>) -> Result<Sandbox> {
             Err(Error::Unsupported(MSG.into()))
         }
         async fn destroy(&self, _id: &SandboxId) -> Result<()> {
