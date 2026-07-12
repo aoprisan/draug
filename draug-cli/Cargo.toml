@@ -15,3 +15,4 @@ draug-core.workspace = true
 draug-ns.workspace = true
 tokio.workspace = true
 clap.workspace = true
+serde_json.workspace = true

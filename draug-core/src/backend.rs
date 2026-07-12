@@ -73,9 +73,12 @@ pub trait Backend: Send + Sync {
     /// files, not processes).
     async fn snapshot(&self, id: &SandboxId, name: &str) -> Result<SnapshotId>;
 
-    /// Replace the sandbox's filesystem with a snapshot's contents.
-    /// Running processes are killed, not resurrected.
-    async fn restore(&self, id: &SandboxId, snapshot: &SnapshotId) -> Result<()>;
+    /// Materialize a NEW sandbox whose writable layer starts from
+    /// `snapshot`'s captured layer, on top of the same base image. The
+    /// snapshot itself is immutable and can be restored any number of
+    /// times; the sandbox it was taken from is left untouched. Files come
+    /// back exactly as captured — processes do not (see DESIGN.md).
+    async fn restore(&self, snapshot: &SnapshotId, name: Option<String>) -> Result<Sandbox>;
 
     /// Kill everything, unmount, delete on-disk state, deregister.
     /// Idempotent.

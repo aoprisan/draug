@@ -73,11 +73,26 @@ enum Command {
     /// Snapshots capture files, not processes: after restore, re-run
     /// whatever was running.
     Snapshot { sandbox: String, name: String },
-    /// Replace a sandbox's filesystem with a snapshot's contents
-    Restore { sandbox: String, snapshot: String },
-    /// Show filesystem changes between two snapshots, or between a
-    /// snapshot and the live sandbox
-    Diff { from: String, to: Option<String> },
+    /// Materialize a new sandbox whose writable layer starts from a
+    /// snapshot's captured contents (over the same base image). The
+    /// snapshot and any originating sandbox are left untouched.
+    Restore {
+        /// Snapshot id or name to restore from
+        snapshot: String,
+        /// Name for the new sandbox
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show a layer's filesystem changes against its base image, as
+    /// added/modified/deleted paths. The target is a snapshot or a live
+    /// sandbox (id or name).
+    Diff {
+        /// Snapshot or sandbox to inspect
+        target: String,
+        /// Emit machine-readable JSON instead of a text summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a sandbox's processes and delete all its state
     Destroy { sandbox: String },
     /// Serve the draug MCP server over stdio
@@ -234,10 +249,45 @@ async fn dispatch(
             eprintln!("sandbox {id} destroyed");
             Ok(0)
         }
-        Command::Snapshot { .. } | Command::Restore { .. } | Command::Diff { .. } => {
-            Err(Error::Unsupported(
-                "snapshot/restore/diff are not implemented yet".into(),
-            ))
+        Command::Snapshot { sandbox, name } => {
+            let sb = registry.get_sandbox(&sandbox)?;
+            let snap = backend.snapshot(&sb.id, &name).await?;
+            eprintln!("snapshot {snap} ({name}) captured from {}", sb.id);
+            println!("{snap}");
+            Ok(0)
+        }
+        Command::Restore { snapshot, name } => {
+            let snap = registry.get_snapshot(&snapshot)?;
+            let sb = backend.restore(&snap.id, name).await?;
+            match &sb.name {
+                Some(n) => eprintln!("restored snapshot {} into sandbox {} ({n})", snap.id, sb.id),
+                None => eprintln!("restored snapshot {} into sandbox {}", snap.id, sb.id),
+            }
+            println!("{}", sb.id);
+            Ok(0)
+        }
+        Command::Diff { target, json } => {
+            let entries = backend.diff(&target).await?;
+            if json {
+                let out = serde_json::to_string_pretty(&entries)
+                    .map_err(|e| Error::io("serialize diff", std::io::Error::other(e)))?;
+                println!("{out}");
+            } else if entries.is_empty() {
+                eprintln!("no changes against the base image");
+            } else {
+                for e in &entries {
+                    let mark = match e.kind {
+                        draug_core::DiffKind::Added => '+',
+                        draug_core::DiffKind::Modified => '~',
+                        draug_core::DiffKind::Deleted => '-',
+                    };
+                    match &e.size {
+                        Some(size) => println!("{mark} {} ({size} bytes)", e.path),
+                        None => println!("{mark} {}", e.path),
+                    }
+                }
+            }
+            Ok(0)
         }
         Command::Mcp => Err(Error::Unsupported(
             "the MCP server is not implemented yet".into(),

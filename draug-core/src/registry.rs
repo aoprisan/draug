@@ -14,7 +14,7 @@ use crate::error::{Error, ResourceKind, Result};
 use crate::limits::ResourceLimits;
 use crate::types::{Sandbox, SandboxId, SandboxState, SnapshotId, SnapshotMeta};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sandbox (
@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS snapshot (
     sandbox_id TEXT REFERENCES sandbox(id) ON DELETE SET NULL,
     name       TEXT NOT NULL,
     path       TEXT NOT NULL,
+    rootfs     TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     UNIQUE (sandbox_id, name)
 );
@@ -62,7 +64,15 @@ impl Registry {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA)?;
+        // v1 -> v2: the snapshot table gained rootfs and size_bytes.
+        if version == 1 && !has_column(&conn, "snapshot", "rootfs")? {
+            conn.execute_batch(
+                "ALTER TABLE snapshot ADD COLUMN rootfs TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE snapshot ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -166,13 +176,15 @@ impl Registry {
     pub fn insert_snapshot(&self, snap: &SnapshotMeta) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let res = conn.execute(
-            "INSERT INTO snapshot (id, sandbox_id, name, path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO snapshot (id, sandbox_id, name, path, rootfs, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 snap.id.0,
                 snap.sandbox_id.as_ref().map(|s| s.0.as_str()),
                 snap.name,
                 snap.path.to_string_lossy(),
+                snap.rootfs.to_string_lossy(),
+                snap.size_bytes as i64,
                 snap.created_at,
             ],
         );
@@ -190,7 +202,7 @@ impl Registry {
     pub fn get_snapshot(&self, id_or_name: &str) -> Result<SnapshotMeta> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, sandbox_id, name, path, created_at
+            "SELECT id, sandbox_id, name, path, rootfs, size_bytes, created_at
              FROM snapshot WHERE id = ?1 OR name = ?1",
         )?;
         stmt.query_row(params![id_or_name], row_to_snapshot)
@@ -205,11 +217,28 @@ impl Registry {
     pub fn list_snapshots(&self, sandbox: Option<&SandboxId>) -> Result<Vec<SnapshotMeta>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, sandbox_id, name, path, created_at FROM snapshot
+            "SELECT id, sandbox_id, name, path, rootfs, size_bytes, created_at FROM snapshot
              WHERE ?1 IS NULL OR sandbox_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![sandbox.map(|s| s.0.as_str())], row_to_snapshot)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Record the measured size of a snapshot's captured layer, once the
+    /// copy that produced it has finished.
+    pub fn set_snapshot_size(&self, id: &SnapshotId, size_bytes: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE snapshot SET size_bytes = ?2 WHERE id = ?1",
+            params![id.0, size_bytes as i64],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound {
+                kind: ResourceKind::Snapshot,
+                id: id.0.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn remove_snapshot(&self, id: &SnapshotId) -> Result<()> {
@@ -249,8 +278,22 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotMeta> {
         sandbox_id: row.get::<_, Option<String>>(1)?.map(SandboxId),
         name: row.get(2)?,
         path: PathBuf::from(row.get::<_, String>(3)?),
-        created_at: row.get(4)?,
+        rootfs: PathBuf::from(row.get::<_, String>(4)?),
+        size_bytes: row.get::<_, i64>(5)? as u64,
+        created_at: row.get(6)?,
     })
+}
+
+/// Whether `table` has a column named `column` (for schema migrations).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -307,10 +350,15 @@ mod tests {
             sandbox_id: Some(SandboxId("sb1".into())),
             name: "before-tests".into(),
             path: PathBuf::from("/var/lib/draug/snapshots/sn1"),
+            rootfs: PathBuf::from("/images/base"),
+            size_bytes: 42,
             created_at: 2,
         };
         reg.insert_snapshot(&snap).unwrap();
-        assert_eq!(reg.get_snapshot("before-tests").unwrap().id.0, "sn1");
+        let got = reg.get_snapshot("before-tests").unwrap();
+        assert_eq!(got.id.0, "sn1");
+        assert_eq!(got.rootfs, PathBuf::from("/images/base"));
+        assert_eq!(got.size_bytes, 42);
         assert_eq!(
             reg.list_snapshots(Some(&SandboxId("sb1".into()))).unwrap().len(),
             1

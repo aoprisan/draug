@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use draug_core::proto::{GuestMessage, HostMessage, MAX_FRAME_LEN};
 use draug_core::{
     Backend, Error, ExecEvent, ExecHandle, ExecRequest, Registry, Result, Sandbox, SandboxId,
-    SandboxSpec, SandboxState, SnapshotId,
+    SandboxSpec, SandboxState, SnapshotId, SnapshotMeta,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -18,13 +18,19 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
-use super::reexec::{CLEANUP_DIR_ENV, CONFIG_ENV, MODE_CLEANUP, MODE_SETUP, REEXEC_ENV};
+use super::reexec::{
+    CLEANUP_DIR_ENV, CONFIG_ENV, COPY_DST_ENV, COPY_SRC_ENV, MODE_CLEANUP, MODE_COPY, MODE_SETUP,
+    REEXEC_ENV,
+};
 use super::setup::{SetupConfig, SOCKET_NAME};
-use super::{cgroup, uidmap};
+use super::{cgroup, fscopy, uidmap};
 
 const BACKEND_NAME: &str = "ns";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Layer copies scale with the sandbox's writes; allow far more than setup.
+const COPY_TIMEOUT: Duration = Duration::from_secs(600);
 
+#[derive(Clone)]
 pub struct NsBackend {
     registry: Arc<Registry>,
     state_root: PathBuf,
@@ -55,23 +61,62 @@ impl NsBackend {
     fn state_dir(&self, id: &SandboxId) -> PathBuf {
         self.state_root.join(&id.0)
     }
+
+    fn snapshot_dir(&self, id: &SnapshotId) -> PathBuf {
+        self.state_root.join("snapshots").join(&id.0)
+    }
+
+    /// Structural diff of a layer against its base image, as
+    /// added/modified/deleted paths. `target` is a snapshot (id or name) or
+    /// a live sandbox (id or name): a snapshot diffs its captured upper
+    /// layer, a sandbox diffs its live upper layer. Overlayfs whiteouts are
+    /// decoded as deletions. Not on the `Backend` trait — it is a read-only
+    /// inspection the CLI/MCP frontends call directly.
+    pub async fn diff(&self, target: &str) -> Result<Vec<draug_core::DiffEntry>> {
+        let (upper, base) = self.resolve_layer(target).await?;
+        tokio::task::spawn_blocking(move || super::diff::diff_upper(&upper, &base))
+            .await
+            .map_err(|e| Error::io("diff task", std::io::Error::other(e)))?
+    }
+
+    /// Resolve a snapshot-or-sandbox reference to `(upper_layer, base_image)`.
+    /// Snapshots win over sandboxes on an id/name clash (they are the more
+    /// specific, immutable artifact).
+    async fn resolve_layer(&self, target: &str) -> Result<(PathBuf, PathBuf)> {
+        let key = target.to_owned();
+        if let Ok(snap) = self.reg(move |r| r.get_snapshot(&key)).await {
+            return Ok((snap.path.join("upper"), snap.rootfs));
+        }
+        let key = target.to_owned();
+        let sb = self.reg(move |r| r.get_sandbox(&key)).await?;
+        Ok((sb.state_dir.join("upper"), sb.rootfs))
+    }
 }
 
 #[async_trait]
 impl Backend for NsBackend {
     async fn spawn(&self, spec: &SandboxSpec) -> Result<Sandbox> {
         let project_dir = validate_project_dir(&spec.rootfs)?;
-        if spec.from_snapshot.is_some() {
-            return Err(Error::Unsupported(
-                "--from-snapshot is not implemented yet".into(),
-            ));
-        }
 
         let id = SandboxId(random_id()?);
         let state_dir = self.state_dir(&id);
         for sub in ["upper", "work", "rt", "root"] {
             std::fs::create_dir_all(state_dir.join(sub))
                 .map_err(|e| Error::io("create state dir", e))?;
+        }
+
+        // Seed the writable layer from a snapshot's captured upper layer, if
+        // asked. The snapshot's upper may hold subordinate-uid files and
+        // whiteouts, so the copy runs through the userns copy helper.
+        if let Some(snap_id) = &spec.from_snapshot {
+            let key = snap_id.0.clone();
+            let snap = self.reg(move |r| r.get_snapshot(&key)).await?;
+            let src = snap.path.join("upper");
+            let dst = state_dir.join("upper");
+            copy_layer(&src, &dst).await.map_err(|e| {
+                // spawn's caller rolls back via destroy; surface the cause.
+                Error::io("seed upper from snapshot", std::io::Error::other(e.to_string()))
+            })?;
         }
 
         let sandbox = Sandbox {
@@ -185,16 +230,95 @@ impl Backend for NsBackend {
         Ok(ExecHandle::new(rx))
     }
 
-    async fn snapshot(&self, _id: &SandboxId, _name: &str) -> Result<SnapshotId> {
-        Err(Error::Unsupported(
-            "snapshot is not implemented for the ns backend yet".into(),
-        ))
+    async fn snapshot(&self, id: &SandboxId, name: &str) -> Result<SnapshotId> {
+        if name.trim().is_empty() {
+            return Err(Error::InvalidSpec("snapshot name must not be empty".into()));
+        }
+        let key = id.0.clone();
+        let sb = self.reg(move |r| r.get_sandbox(&key)).await?;
+
+        let snap_id = SnapshotId(random_id()?);
+        let snap_dir = self.snapshot_dir(&snap_id);
+        let dst_upper = snap_dir.join("upper");
+        std::fs::create_dir_all(&snap_dir).map_err(|e| Error::io("create snapshot dir", e))?;
+
+        // Registry-first: record intent before touching the kernel, so a
+        // crash mid-copy leaves a row (and its dir) that destroy/gc reclaims.
+        let meta = SnapshotMeta {
+            id: snap_id.clone(),
+            sandbox_id: Some(sb.id.clone()),
+            name: name.to_owned(),
+            path: snap_dir.clone(),
+            rootfs: sb.rootfs.clone(),
+            size_bytes: 0,
+            created_at: unix_now(),
+        };
+        {
+            let m = meta.clone();
+            if let Err(e) = self.reg(move |r| r.insert_snapshot(&m)).await {
+                let _ = std::fs::remove_dir_all(&snap_dir);
+                return Err(e);
+            }
+        }
+
+        // Freeze the sandbox's processes so no writer mutates the upper layer
+        // mid-copy, syncfs to flush the page cache, copy, then thaw. The
+        // freeze is best-effort (a sandbox with no cgroup, or an already-dead
+        // guest, simply skips it) but the copy always runs.
+        let cg = read_cgroup_path(&sb.state_dir);
+        let froze = match &cg {
+            Some(path) => {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || cgroup::freeze(&path))
+                    .await
+                    .map_err(|e| Error::io("freeze task", std::io::Error::other(e)))?
+                    .is_ok()
+            }
+            None => false,
+        };
+
+        let src_upper = sb.state_dir.join("upper");
+        syncfs_dir(&src_upper).await;
+        let result = copy_layer(&src_upper, &dst_upper).await;
+
+        if froze {
+            if let Some(path) = &cg {
+                let path = path.clone();
+                let _ = tokio::task::spawn_blocking(move || cgroup::unfreeze(&path)).await;
+            }
+        }
+
+        match result {
+            Ok(size) => {
+                let sid = snap_id.clone();
+                self.reg(move |r| r.set_snapshot_size(&sid, size)).await?;
+                Ok(snap_id)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&snap_dir);
+                let sid = snap_id.clone();
+                let _ = self.reg(move |r| r.remove_snapshot(&sid)).await;
+                Err(e)
+            }
+        }
     }
 
-    async fn restore(&self, _id: &SandboxId, _snapshot: &SnapshotId) -> Result<()> {
-        Err(Error::Unsupported(
-            "restore is not implemented for the ns backend yet".into(),
-        ))
+    async fn restore(&self, snapshot: &SnapshotId, name: Option<String>) -> Result<Sandbox> {
+        let key = snapshot.0.clone();
+        let snap = self.reg(move |r| r.get_snapshot(&key)).await?;
+
+        // Restore materializes a fresh sandbox seeded from the snapshot's
+        // captured layer, over the same base image. This never mutates the
+        // snapshot and leaves any originating sandbox alone.
+        let spec = SandboxSpec {
+            name,
+            rootfs: snap.rootfs.clone(),
+            from_snapshot: Some(snap.id.clone()),
+            limits: draug_core::ResourceLimits::unlimited(),
+            env: vec![],
+            network: false,
+        };
+        self.spawn(&spec).await
     }
 
     async fn destroy(&self, id: &SandboxId) -> Result<()> {
@@ -399,6 +523,101 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// --- layer copying (snapshot / restore) --------------------------------------
+
+/// The sandbox cgroup path recorded at spawn time, if any.
+fn read_cgroup_path(state_dir: &Path) -> Option<PathBuf> {
+    let s = std::fs::read_to_string(state_dir.join("cgroup.path")).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| PathBuf::from(s))
+}
+
+/// Flush the filesystem backing `dir` so a subsequent copy sees committed
+/// data. Best-effort: a missing dir or an fs that ignores syncfs is fine.
+async fn syncfs_dir(dir: &Path) {
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(f) = std::fs::File::open(&dir) {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::syncfs(f.as_raw_fd()) };
+        }
+    })
+    .await;
+}
+
+/// Copy an overlay upper layer from `src` to `dst`, preserving whiteouts,
+/// xattrs, and ownership. Tries a direct in-process copy first (succeeds as
+/// real root, or when every file is owned by the caller); on a privilege
+/// error — subordinate-uid files or whiteout device nodes we cannot recreate
+/// unprivileged — retries inside a user namespace via the copy helper.
+/// Returns the total regular-file bytes copied.
+async fn copy_layer(src: &Path, dst: &Path) -> Result<u64> {
+    let (s, d) = (src.to_path_buf(), dst.to_path_buf());
+    let direct = tokio::task::spawn_blocking(move || fscopy::copy_tree(&s, &d))
+        .await
+        .map_err(|e| Error::io("copy task", std::io::Error::other(e)))?;
+    match direct {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Partial output from the failed attempt must not corrupt the
+            // helper's copy; the helper recreates the tree from scratch.
+            let _ = tokio::fs::remove_dir_all(dst).await;
+            copy_layer_via_helper(src, dst).await
+        }
+        Err(e) => Err(Error::io("copy layer", e)),
+    }
+}
+
+/// Drive the re-exec'd copy helper: it enters a user namespace, we write the
+/// spawn-time uid/gid maps, it copies and reports `done <bytes>`. Mirrors the
+/// cleanup-helper line protocol.
+async fn copy_layer_via_helper(src: &Path, dst: &Path) -> Result<u64> {
+    let mut child = Command::new("/proc/self/exe")
+        .env(REEXEC_ENV, MODE_COPY)
+        .env(COPY_SRC_ENV, src.as_os_str())
+        .env(COPY_DST_ENV, dst.as_os_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error::io("spawn copy helper", e))?;
+    let pid = child.id().unwrap_or_default();
+    let mut stdin = child.stdin.take().expect("piped");
+    let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
+
+    let drive = async {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| Error::io("copy helper", e))?
+        {
+            if line == "unshared" {
+                uidmap::write_maps(pid)?;
+                stdin
+                    .write_all(b"go\n")
+                    .await
+                    .map_err(|e| Error::io("copy helper", e))?;
+            } else if let Some(n) = line.strip_prefix("done ") {
+                return n
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| Error::io("copy helper", std::io::Error::other(e)));
+            } else if let Some(msg) = line.strip_prefix("err ") {
+                return Err(Error::io("copy helper", std::io::Error::other(msg.to_owned())));
+            }
+        }
+        Err(Error::io(
+            "copy helper",
+            std::io::Error::other("helper exited without confirming"),
+        ))
+    };
+    let res = tokio::time::timeout(COPY_TIMEOUT, drive)
+        .await
+        .unwrap_or_else(|_| Err(Error::io("copy helper", std::io::Error::other("timed out"))));
+    let _ = child.wait().await;
+    res
 }
 
 // --- guest process management ------------------------------------------------

@@ -16,7 +16,11 @@ pub struct CgroupHandle {
 }
 
 /// Create a cgroup for sandbox `id` and write the requested limits.
-/// Returns `Ok(None)` when no limits were requested.
+///
+/// A cgroup is created even when no limits were requested — snapshotting
+/// uses it to freeze the sandbox's processes — but in that case it is
+/// best-effort: `Ok(None)` on hosts without a writable cgroup v2 subtree.
+/// With limits set, failure to enforce them is a hard error.
 pub fn create(id: &str, limits: &ResourceLimits) -> Result<Option<CgroupHandle>> {
     let mut controllers: Vec<&str> = Vec::new();
     if limits.memory_bytes.is_some() {
@@ -28,30 +32,39 @@ pub fn create(id: &str, limits: &ResourceLimits) -> Result<Option<CgroupHandle>>
     if limits.pids.is_some() {
         controllers.push("pids");
     }
-    if controllers.is_empty() {
-        return Ok(None);
-    }
+    let required = !controllers.is_empty();
 
-    let base = own_cgroup_dir()?;
-    let available = std::fs::read_to_string(base.join("cgroup.controllers"))
-        .map_err(|e| Error::io("read cgroup.controllers", e))?;
-    for c in &controllers {
-        if !available.split_whitespace().any(|a| a == *c) {
-            return Err(Error::Unsupported(format!(
-                "cgroup controller \"{c}\" is not available in {} (available: {}). \
-                 Resource limits need a delegated cgroup v2 subtree: on systemd hosts set \
-                 Delegate=cpu memory pids for user@.service, or launch via \
-                 `systemd-run --user --scope -p Delegate=yes ...`, or omit the limits",
-                base.display(),
-                available.trim()
-            )));
+    let base = match own_cgroup_dir() {
+        Ok(base) => base,
+        Err(e) if required => return Err(e),
+        Err(_) => return Ok(None),
+    };
+
+    if required {
+        let available = std::fs::read_to_string(base.join("cgroup.controllers"))
+            .map_err(|e| Error::io("read cgroup.controllers", e))?;
+        for c in &controllers {
+            if !available.split_whitespace().any(|a| a == *c) {
+                return Err(Error::Unsupported(format!(
+                    "cgroup controller \"{c}\" is not available in {} (available: {}). \
+                     Resource limits need a delegated cgroup v2 subtree: on systemd hosts set \
+                     Delegate=cpu memory pids for user@.service, or launch via \
+                     `systemd-run --user --scope -p Delegate=yes ...`, or omit the limits",
+                    base.display(),
+                    available.trim()
+                )));
+            }
         }
+        enable_controllers(&base, &controllers)?;
     }
-
-    enable_controllers(&base, &controllers)?;
 
     let dir = base.join(format!("draug-{id}"));
-    std::fs::create_dir(&dir).map_err(|e| Error::io("create sandbox cgroup", e))?;
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) if required => return Err(Error::io("create sandbox cgroup", e)),
+        Err(_) => return Ok(None),
+    }
     let write_limit = |file: &str, value: String| -> Result<()> {
         std::fs::write(dir.join(file), value).map_err(|e| Error::io("write cgroup limit", e))
     };
@@ -72,6 +85,31 @@ pub fn create(id: &str, limits: &ResourceLimits) -> Result<Option<CgroupHandle>>
 pub fn add_pid(handle: &CgroupHandle, pid: u32) -> Result<()> {
     std::fs::write(handle.path.join("cgroup.procs"), pid.to_string())
         .map_err(|e| Error::io("move process into cgroup", e))
+}
+
+/// Freeze every process in the cgroup (cgroup v2 core freezer) and wait
+/// briefly for the kernel to report the frozen state. Used to quiesce a
+/// sandbox's filesystem writers while its upper layer is copied.
+pub fn freeze(path: &Path) -> Result<()> {
+    std::fs::write(path.join("cgroup.freeze"), "1")
+        .map_err(|e| Error::io("freeze sandbox cgroup", e))?;
+    // "frozen 1" appears in cgroup.events once every task has actually
+    // stopped. Cap the wait: a task stuck in an uninterruptible syscall can
+    // delay this indefinitely, and an approximate freeze still quiesces.
+    for _ in 0..80 {
+        let events = std::fs::read_to_string(path.join("cgroup.events")).unwrap_or_default();
+        if events.lines().any(|l| l.trim() == "frozen 1") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+/// Thaw a cgroup frozen by [`freeze`].
+pub fn unfreeze(path: &Path) -> Result<()> {
+    std::fs::write(path.join("cgroup.freeze"), "0")
+        .map_err(|e| Error::io("unfreeze sandbox cgroup", e))
 }
 
 /// Best-effort teardown: kill any stragglers, then remove the directory.

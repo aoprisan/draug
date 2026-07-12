@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod cgroup;
+pub mod diff;
+pub mod fscopy;
 pub mod reexec;
 pub mod setup;
 pub mod uidmap;
