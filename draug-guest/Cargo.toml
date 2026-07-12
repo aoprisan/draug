@@ -1,0 +1,13 @@
+[package]
+name = "draug-guest"
+description = "Static guest agent for draug sandboxes (PID 1 inside the sandbox)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Intentionally dependency-free for now: this must build as a small static
+# binary (x86_64-unknown-linux-musl). The exec protocol types will be shared
+# via a lightweight module of draug-core (or a draug-proto crate) once the
+# protocol implementation lands, without pulling in tokio/rusqlite.
+[dependencies]

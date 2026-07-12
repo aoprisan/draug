@@ -1,0 +1,17 @@
+[package]
+name = "draug-cli"
+description = "sbx: CLI and MCP server for draug sandboxes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sbx"
+path = "src/main.rs"
+
+[dependencies]
+draug-core.workspace = true
+draug-ns.workspace = true
+tokio.workspace = true
+clap.workspace = true
