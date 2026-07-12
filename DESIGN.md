@@ -16,16 +16,20 @@ against it rather than trusting itself.
 
 | Crate | Role |
 |---|---|
-| `draug-core` | `Backend` trait, sandbox/snapshot registry (SQLite via `rusqlite`), resource-limit types, error taxonomy, exec protocol types |
-| `draug-ns` | Namespace backend: user/mount/pid/net namespaces + overlayfs + cgroup v2. The default (and currently only) backend. |
-| `draug-guest` | Static guest agent binary (musl). PID 1 inside the sandbox; speaks the exec protocol over a unix socket. |
+| `draug-core` | `Backend` trait, sandbox/snapshot registry (SQLite via `rusqlite`), resource-limit types, error taxonomy |
+| `draug-proto` | Exec protocol wire types + sync framing; tokio-free so the guest can link it |
+| `draug-ns` | Namespace backend: user/mount/pid/net/uts namespaces + overlayfs + cgroup v2. The default (and currently only) backend. |
+| `draug-guest` | Guest agent library + binary. PID 1 inside the sandbox; speaks the exec protocol over a unix socket. |
 | `draug-cli` | The `sbx` binary (clap): `run`, `exec`, `snapshot`, `restore`, `diff`, `destroy`, `mcp` |
 
-Dependency direction: `draug-cli → draug-ns → draug-core`. `draug-guest`
-depends on nothing in the workspace today; once the exec protocol types are
-stable they move into a small no-heavy-deps module of `draug-core` (or a
-dedicated `draug-proto` crate) that the guest can link without pulling in
-tokio/rusqlite.
+Dependency direction: `draug-cli → draug-ns → {draug-core, draug-guest} →
+draug-proto`. `draug-core::proto` re-exports `draug-proto`. In the namespace
+backend the guest is not exec'd as a separate binary: the setup process
+(a re-execution of the host binary itself, see draug-ns docs) forks and
+calls `draug_guest::guest_main` directly, so any binary embedding draug-ns
+must call `draug_ns::reexec::maybe_run()` first thing in `main`. The
+standalone `draug-guest` binary (static musl) is the entry point reserved
+for future VM-class backends.
 
 ## The `Backend` trait
 
@@ -143,9 +147,9 @@ must decode those rather than treat them as regular files.
 
 ## Exec protocol
 
-Transport: a unix stream socket per sandbox
-(`$XDG_RUNTIME_DIR/draug/<sandbox-id>/guest.sock`), bind-mounted into the
-sandbox at a fixed path where `draug-guest` (PID 1 inside) listens. The host
+Transport: a unix stream socket per sandbox, host path
+`<state-dir>/rt/guest.sock`, bind-mounted into the sandbox at `/run/draug`
+where the guest agent (PID 1 inside) listens. The host
 side connects per-exec; the guest multiplexes nothing — **one connection ==
 one exec**, which keeps framing trivial and lets connection close double as
 cancellation.

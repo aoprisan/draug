@@ -35,6 +35,9 @@ pub enum ExecEvent {
         code: Option<i32>,
         signal: Option<i32>,
     },
+    /// Terminal event: the exec itself failed (spawn error, timeout,
+    /// protocol breakdown). Kinds match `draug_proto::error_kind`.
+    Failed { kind: String, message: String },
 }
 
 /// Handle to an in-flight exec. Dropping it cancels the exec (best-effort
