@@ -76,13 +76,23 @@ pub trait Backend: Send + Sync {
   `restore` must not leak kernel state unaccounted for. The rule is
   *registry-first*: record intent (row in state `Creating`/`Restoring`)
   before touching the kernel, and mark `Ready` only after. Anything left in
-  an intermediate state is garbage-collectable by `destroy` or a future
-  `sbx gc`. Dropping an `ExecHandle` kills the remote command (best-effort
-  SIGKILL to the exec'd process group via the guest).
+  an intermediate state is reclaimed by `NsBackend::reconcile()`, which every
+  `sbx`/`mcp` process runs at startup: it walks the registry, and for any
+  sandbox whose guest is provably gone (pid+starttime mismatch, or a zombie)
+  it frees the cgroup, deletes the on-disk state, and drops the row; it also
+  thaws a cgroup left frozen by a crash mid-snapshot. Dropping an `ExecHandle`
+  kills the remote command (best-effort SIGKILL to the exec'd process group
+  via the guest).
 - `Backend` implementations are cheap handles (`Arc` internals) — cloneable,
-  shareable across tasks; per-sandbox mutation is serialized by a
-  per-sandbox async lock inside the backend, so concurrent `exec` +
-  `snapshot` on the same sandbox cannot interleave destructively.
+  shareable across tasks. `spawn`, `snapshot`, and `destroy` on one sandbox
+  are serialized by a per-sandbox `flock` on `<state-dir>/op.lock`, which
+  holds across tasks *and* across processes (zero-daemon: several `sbx`
+  invocations can race). That lock is also what lets `reconcile` distinguish
+  a crashed sandbox (lock free) from one with an operation in flight (lock
+  held), so startup GC never reaps a sibling's in-progress spawn. `exec` is
+  deliberately *not* gated by the op-lock — snapshotting a *live* sandbox
+  instead relies on the cgroup freeze (best-effort; see the snapshot section)
+  for a consistent upper layer.
 
 ### Sandbox lifecycle states
 

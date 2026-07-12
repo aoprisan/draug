@@ -56,6 +56,10 @@ mod other {
         pub async fn diff(&self, _target: &str) -> Result<Vec<draug_core::DiffEntry>> {
             Err(Error::Unsupported(MSG.into()))
         }
+
+        pub async fn reconcile(&self) -> Result<usize> {
+            Ok(0)
+        }
     }
 
     #[async_trait]

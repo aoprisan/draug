@@ -45,6 +45,8 @@ mod linux {
             ("registry_lifecycle_and_destroy", lifecycle),
             ("snapshot_restore_roundtrip", snapshot_restore_roundtrip),
             ("diff_reports_whiteouts_as_deletions", diff_whiteouts),
+            ("reconcile_reaps_dead_and_keeps_live", reconcile_reaps),
+            ("exec_rejects_tampered_socket", tampered_socket),
         ];
 
         let env = Env::new();
@@ -164,6 +166,7 @@ mod linux {
             limits: ResourceLimits::unlimited(),
             env: vec![("DRAUG_TEST_MARKER".into(), "1".into())],
             network: false,
+            allow_host_proc_fallback: false,
         }
     }
 
@@ -403,6 +406,89 @@ mod linux {
             snap_entries.iter().find(|e| e.path == "remove.txt").map(|e| e.kind),
             Some(DiffKind::Deleted),
             "snapshot diff lost the whiteout: {snap_entries:?}"
+        );
+
+        env.rt.block_on(env.backend.destroy(&sb.id)).unwrap();
+    }
+
+    fn guest_pid(state_dir: &Path) -> i32 {
+        let content = std::fs::read_to_string(state_dir.join("guest.pid")).unwrap();
+        content.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    fn wait_gone(pid: i32) {
+        for _ in 0..200 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("guest pid {pid} did not exit after SIGKILL");
+    }
+
+    fn reconcile_reaps(env: &Env) {
+        use draug_core::Error;
+
+        let (sb, _project) = env.fresh_sandbox("reap_project", &[("f.txt", "1\n")]);
+
+        // A LIVE sandbox must survive reconcile untouched.
+        let reaped = env.rt.block_on(env.backend.reconcile()).unwrap();
+        assert!(
+            env.registry.get_sandbox(&sb.id.0).is_ok(),
+            "reconcile reaped a live sandbox (reaped {reaped})"
+        );
+        assert!(sb.state_dir.exists());
+        // ...and it still works.
+        assert_eq!(env.sh_in(&sb.id, "cat f.txt").stdout, "1\n");
+
+        // Simulate a host crash: SIGKILL the guest (PID 1 of the sandbox), so
+        // the row + on-disk state remain but the guest is gone.
+        let pid = guest_pid(&sb.state_dir);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        wait_gone(pid);
+
+        let reaped = env.rt.block_on(env.backend.reconcile()).unwrap();
+        assert!(reaped >= 1, "reconcile did not reap the dead sandbox");
+        assert!(
+            matches!(env.registry.get_sandbox(&sb.id.0), Err(Error::NotFound { .. })),
+            "dead sandbox row survived reconcile"
+        );
+        assert!(
+            !sb.state_dir.exists(),
+            "dead sandbox state dir survived reconcile: {}",
+            sb.state_dir.display()
+        );
+    }
+
+    fn tampered_socket(env: &Env) {
+        use draug_core::Error;
+
+        let (sb, _project) = env.fresh_sandbox("tamper_project", &[("f.txt", "1\n")]);
+        // Replace the guest socket with a symlink, as a malicious process
+        // inside the sandbox could (rt/ is bind-mounted writable).
+        let sock = sb.state_dir.join("rt").join("guest.sock");
+        std::fs::remove_file(&sock).unwrap();
+        std::os::unix::fs::symlink("/tmp/draug-does-not-exist.sock", &sock).unwrap();
+
+        let res = env.rt.block_on(env.backend.exec(
+            &sb.id,
+            ExecRequest {
+                argv: vec!["true".into()],
+                env: vec![],
+                cwd: None,
+                timeout_ms: None,
+            },
+        ));
+        let refused = match res {
+            Err(Error::Protocol(_)) => true,
+            Err(other) => panic!("expected Protocol error, got {other}"),
+            Ok(_) => false,
+        };
+        assert!(
+            refused,
+            "exec followed a tampered (symlinked) socket instead of refusing"
         );
 
         env.rt.block_on(env.backend.destroy(&sb.id)).unwrap();

@@ -92,6 +92,13 @@ pub struct SandboxSpec {
     pub env: Vec<(String, String)>,
     /// Whether the sandbox gets (loopback-only) network access.
     pub network: bool,
+    /// Insecure escape hatch: if a private `/proc` cannot be mounted (a host
+    /// that masks parts of `/proc`, e.g. running draug inside a hardened
+    /// container), fall back to bind-mounting the *host's* `/proc`. This
+    /// exposes host processes via `/proc/<pid>/{root,cwd,fd}` — a filesystem
+    /// escape to the invoking user's own files — so it is **off by default**;
+    /// spawn fails closed instead. Only enable on a trusted host.
+    pub allow_host_proc_fallback: bool,
 }
 
 /// A live sandbox as recorded in the registry.

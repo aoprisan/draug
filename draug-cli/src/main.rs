@@ -54,6 +54,12 @@ enum Command {
         /// Extra environment for every exec, KEY=VALUE (repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// UNSAFE: if a private /proc can't be mounted (a host that masks
+        /// /proc), fall back to the host's /proc. This exposes host processes
+        /// and the user's files via /proc/<pid>/root — off by default; the
+        /// sandbox fails closed instead.
+        #[arg(long)]
+        insecure_host_proc: bool,
     },
     /// Run a command inside a sandbox, streaming its output
     Exec {
@@ -156,6 +162,14 @@ async fn run(cli: Cli) -> i32 {
     };
     let backend = NsBackend::new(Arc::clone(&registry), state_root);
 
+    // Self-heal: reap sandboxes whose guest died (crash/reboot) and thaw any
+    // cgroup left frozen by a crash mid-snapshot, before doing anything else.
+    match backend.reconcile().await {
+        Ok(n) if n > 0 => eprintln!("sbx: reconciled {n} stale sandbox(es)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("sbx: warning: reconcile failed: {e}"),
+    }
+
     match dispatch(cli.command, &backend, &registry).await {
         Ok(code) => code,
         Err(e) => {
@@ -179,6 +193,7 @@ async fn dispatch(
             pids_max,
             network,
             env,
+            insecure_host_proc,
         } => {
             let env = parse_env(&env).map_err(Error::InvalidSpec)?;
             let spec = SandboxSpec {
@@ -194,6 +209,7 @@ async fn dispatch(
                 },
                 env,
                 network,
+                allow_host_proc_fallback: insecure_host_proc,
             };
             let sb = backend.spawn(&spec).await?;
             match &sb.name {

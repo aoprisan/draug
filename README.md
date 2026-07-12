@@ -66,7 +66,10 @@ snapshot semantics.
   mount namespace: everything works, but project changes die with the
   sandbox. A warning is printed.
 - Hosts that mask `/proc` (hardened container runtimes) can't get a private
-  `/proc`; the sandbox then sees the host's, with a warning.
+  `/proc`. draug **fails closed** here rather than expose the host's `/proc`
+  (which would leak host processes and the user's files via
+  `/proc/<pid>/root`). Pass `--insecure-host-proc` to override on a trusted
+  host — it bind-mounts the host `/proc` and prints a loud warning.
 - The exec protocol supports stdin frames, but `sbx exec` doesn't wire the
   terminal's stdin up yet, and there is no pty support.
 

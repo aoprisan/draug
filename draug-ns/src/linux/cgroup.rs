@@ -112,6 +112,14 @@ pub fn unfreeze(path: &Path) -> Result<()> {
         .map_err(|e| Error::io("unfreeze sandbox cgroup", e))
 }
 
+/// Whether the cgroup is currently frozen (per `cgroup.events`). False if the
+/// cgroup is gone or has no freezer state.
+pub fn is_frozen(path: &Path) -> bool {
+    std::fs::read_to_string(path.join("cgroup.events"))
+        .map(|s| s.lines().any(|l| l.trim() == "frozen 1"))
+        .unwrap_or(false)
+}
+
 /// Best-effort teardown: kill any stragglers, then remove the directory.
 pub fn destroy(path: &Path) {
     let _ = std::fs::write(path.join("cgroup.kill"), "1");

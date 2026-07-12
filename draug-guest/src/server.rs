@@ -105,10 +105,18 @@ struct ExitInfo {
     signal: Option<i32>,
 }
 
+/// Cap on parked orphan statuses. True orphans (grandchildren reparented to
+/// PID 1 that no exec will ever `wait_child`) accumulate here; without a bound
+/// a workload that spawns many daemons would leak memory in PID 1 unboundedly.
+const MAX_ORPHANS: usize = 4096;
+
 #[derive(Default)]
 struct Router {
     waiters: HashMap<i32, SyncSender<ExitInfo>>,
     orphans: HashMap<i32, ExitInfo>,
+    /// Insertion order of `orphans`, for FIFO eviction when over the cap.
+    /// May hold pids already claimed from `orphans`; those are skipped.
+    orphan_order: std::collections::VecDeque<i32>,
 }
 
 fn router() -> &'static Mutex<Router> {
@@ -148,10 +156,22 @@ fn route(pid: i32, info: ExitInfo) {
             let _ = tx.send(info);
         }
         None => {
-            // Either an exec thread that hasn't registered yet, or a true
-            // orphan. Exec threads clean their entry up; true orphans leak a
-            // map entry of a few bytes, which is acceptable for now.
-            r.orphans.insert(pid, info);
+            // Either an exec thread that hasn't registered yet (it will claim
+            // this shortly), or a true orphan that no one will ever wait on.
+            // Park it, but bound the map: evict oldest once over the cap so a
+            // storm of orphaned grandchildren can't grow PID 1's memory
+            // without limit.
+            if r.orphans.insert(pid, info).is_none() {
+                r.orphan_order.push_back(pid);
+            }
+            while r.orphans.len() > MAX_ORPHANS {
+                match r.orphan_order.pop_front() {
+                    Some(old) => {
+                        r.orphans.remove(&old);
+                    }
+                    None => break,
+                }
+            }
         }
     }
 }
@@ -265,8 +285,14 @@ fn handle_conn(stream: UnixStream, cfg: &GuestConfig) -> io::Result<()> {
     let (done_tx, done_rx) = sync_channel::<()>(1);
     if let Some(ms) = timeout_ms {
         let timed_out = Arc::clone(&timed_out);
+        let done = Arc::clone(&done);
         std::thread::spawn(move || {
-            if done_rx.recv_timeout(Duration::from_millis(ms)).is_err() {
+            // Only kill if the deadline elapsed AND the child hasn't already
+            // finished. The `done` re-check narrows the window where the child
+            // exited and was reaped (its pid now reusable) right as the timer
+            // fired — killing then could hit an unrelated process group.
+            if done_rx.recv_timeout(Duration::from_millis(ms)).is_err() && !done.load(Ordering::SeqCst)
+            {
                 timed_out.store(true, Ordering::SeqCst);
                 kill_group(pid);
             }

@@ -63,6 +63,14 @@ pub async fn serve(
     registry: Arc<Registry>,
     config: McpConfig,
 ) -> draug_core::Result<()> {
+    // Self-heal before serving: reap sandboxes whose guest died and thaw any
+    // cgroup left frozen by a crash. Diagnostics to stderr (stdout is JSON-RPC).
+    match backend.reconcile().await {
+        Ok(n) if n > 0 => eprintln!("sbx: reconciled {n} stale sandbox(es)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("sbx: warning: reconcile failed: {e}"),
+    }
+
     let server = DraugMcp::new(backend, registry, config);
     // stdio() = (tokio stdin, tokio stdout); the SDK frames JSON-RPC over it.
     let running = server
@@ -312,6 +320,8 @@ impl DraugMcp {
             },
             env: args.env.unwrap_or_default().into_iter().collect(),
             network: args.network,
+            // The insecure host-/proc fallback is never offered over MCP.
+            allow_host_proc_fallback: false,
         };
 
         // Quota: hold the create gate across the check *and* the spawn (which
